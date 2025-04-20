@@ -1,0 +1,327 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Auto Defense System for GuardDuty CryptoCurrency Findings
+
+Parameters:
+  IsolationSecurityGroupName:
+    Type: String
+    Default: CryptominerIsolationGroup
+  IncidentLogBucketName:
+    Type: String
+    Default: cryptominer-incident-logs-20250420
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where the isolation security group will be created
+
+Resources:
+
+  ### 1. Isolation Security Group ###
+  IsolationSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Isolation group for infected EC2
+      VpcId: !Ref VPCId
+      SecurityGroupEgress: []
+      SecurityGroupIngress: []
+      Tags:
+        - Key: Name
+          Value: !Ref IsolationSecurityGroupName
+
+  ### 2. S3 Bucket for Incident Logs ###
+  IncidentLogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref IncidentLogBucketName
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  ### 3. IAM Role for Lambda ###
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CryptominerResponderLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CryptominerResponderPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInstanceStatus
+                  - ec2:DescribeSecurityGroups
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ec2:StopInstances
+                  - ec2:ModifyInstanceAttribute
+                  - ec2:ModifyNetworkInterfaceAttribute
+                Resource: '*'
+              - Effect: Allow
+                Action: ec2:ModifyNetworkInterfaceAttribute
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    ec2:AuthorizedSecurityGroup: !GetAtt IsolationSecurityGroup.GroupId
+              - Effect: Allow
+                Action:
+                  - autoscaling:SuspendProcesses
+                  - autoscaling:DescribeAutoScalingGroups
+                  - autoscaling:DescribeAutoScalingInstances
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - guardduty:GetFindings
+                  - guardduty:ListDetectors
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cloudtrail:LookupEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:DeleteLoginProfile
+                  - iam:ListAccessKeys
+                  - iam:UpdateAccessKey
+                  - iam:UpdateAssumeRolePolicy
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub arn:aws:s3:::${IncidentLogBucketName}/*
+
+  ### 4. Lambda Function ###
+  CryptominerResponderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CryptominerResponder
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Timeout: 300
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import time
+          import datetime
+          import os
+
+          # Constants from environment variables
+          QUARANTINE_SG_ID = os.environ.get('QUARANTINE_SG_ID')
+          S3_BUCKET = os.environ.get('S3_BUCKET')
+
+          ec2 = boto3.client('ec2')
+          asg = boto3.client('autoscaling')
+          ct = boto3.client('cloudtrail')
+          iam = boto3.client('iam')
+          s3 = boto3.client('s3')
+
+          def lambda_handler(event, context):
+              print("Received event:", json.dumps(event))
+              timestamp = datetime.datetime.utcnow().isoformat()
+              try:
+                  instance_id = event['detail']['resource']['instanceDetails']['instanceId']
+                  region = event['region']
+                  finding_type = event['detail']['type'][0]
+              except Exception as e:
+                  print("[!] Failed to parse GuardDuty event:", e)
+                  return
+
+              asg_disabled_state = False
+              network_isolated_state = False
+              instance_stopped_state = False
+              instance_ids_to_isolate = set([instance_id])
+
+              try:
+                  asg_info = asg.describe_auto_scaling_instances(InstanceIds=[instance_id])
+                  if asg_info['AutoScalingInstances']:
+                      asg_name = asg_info['AutoScalingInstances'][0]['AutoScalingGroupName']
+                      asg.update_auto_scaling_group(
+                          AutoScalingGroupName=asg_name,
+                          MinSize=0,
+                          MaxSize=0,
+                          DesiredCapacity=0
+                      )
+                      asg_disabled_state = True
+                      asg_detail = asg.describe_auto_scaling_groups(AutoScalingGroupNames=[asg_name])
+                      for i in asg_detail['AutoScalingGroups'][0]['Instances']:
+                          instance_ids_to_isolate.add(i['InstanceId'])
+              except Exception as e:
+                  print(f"[!] ASG handling failed: {e}")
+
+              for iid in instance_ids_to_isolate:
+                  try:
+                      instance = ec2.describe_instances(InstanceIds=[iid])
+                      for eni in instance['Reservations'][0]['Instances'][0]['NetworkInterfaces']:
+                          ec2.modify_network_interface_attribute(
+                              NetworkInterfaceId=eni['NetworkInterfaceId'],
+                              Groups=[QUARANTINE_SG_ID]
+                          )
+                          print(f"[+] Isolated ENI {eni['NetworkInterfaceId']} on instance {iid}")
+                      network_isolated_state = True
+                  except Exception as e:
+                      print(f"[!] Failed to isolate instance {iid}: {e}")
+
+              try:
+                  ec2.stop_instances(InstanceIds=[instance_id])
+                  instance_stopped_state = True
+                  print(f"[+] Stopped instance {instance_id}")
+              except Exception as e:
+                  print(f"[!] Failed to stop instance {instance_id}: {e}")
+
+              actor_type = "Unknown"
+              actor_arn = "Unknown"
+              source_ip = "Unknown"
+              user_agent = "Unknown"
+              freeze_result = None
+              root_involved = False
+
+              try:
+                  events = ct.lookup_events(
+                      LookupAttributes=[{
+                          'AttributeKey': 'ResourceName',
+                          'AttributeValue': instance_id
+                      }],
+                      MaxResults=10
+                  )
+                  for e in events['Events']:
+                      detail = json.loads(e['CloudTrailEvent'])
+                      if detail.get('eventName') == 'RunInstances':
+                          uid = detail['userIdentity']
+                          actor_type = uid['type']
+                          actor_arn = uid['arn']
+                          source_ip = detail.get('sourceIPAddress', 'Unknown')
+                          user_agent = detail.get('userAgent', 'Unknown')
+                          if actor_type == 'IAMUser':
+                              freeze_result = freeze_user(uid['userName'])
+                          elif actor_type == 'AssumedRole':
+                              role_name = uid['sessionContext']['sessionIssuer']['userName']
+                              freeze_result = freeze_role(role_name)
+                          elif actor_type == 'Root':
+                              root_involved = True
+                          break
+              except Exception as e:
+                  print(f"[!] Failed to trace attacker: {e}")
+
+              incident_log = {
+                  "timestamp": timestamp,
+                  "guarddutyFindingType": finding_type,
+                  "instanceId": instance_id,
+                  "region": region,
+                  "actor": {
+                      "type": actor_type,
+                      "arn": actor_arn,
+                      "sourceIp": source_ip,
+                      "userAgent": user_agent
+                  },
+                  "response": {
+                      "asgDisabled": asg_disabled_state,
+                      "networkIsolated": network_isolated_state,
+                      "instanceStopped": instance_stopped_state,
+                      "actorFrozen": freeze_result if freeze_result is not None else False,
+                      "rootInvolved": root_involved,
+                      "manualInterventionRequired": root_involved
+                  }
+              }
+
+              try:
+                  key = f"incidents/{instance_id}-{int(time.time())}.json"
+                  s3.put_object(
+                      Bucket=S3_BUCKET,
+                      Key=key,
+                      Body=json.dumps(incident_log, indent=2),
+                      ContentType="application/json"
+                  )
+                  print(f"[+] Incident log uploaded to s3://{S3_BUCKET}/{key}")
+              except Exception as e:
+                  print(f"[!] Failed to upload incident log: {e}")
+
+          def freeze_user(username):
+              try:
+                  iam.delete_login_profile(UserName=username)
+              except iam.exceptions.NoSuchEntityException:
+                  pass
+              except Exception as e:
+                  print(f"[!] Failed to delete login profile: {e}")
+              try:
+                  keys = iam.list_access_keys(UserName=username)['AccessKeyMetadata']
+                  for key in keys:
+                      iam.update_access_key(
+                          UserName=username,
+                          AccessKeyId=key['AccessKeyId'],
+                          Status='Inactive'
+                      )
+              except Exception as e:
+                  print(f"[!] Failed to disable access keys: {e}")
+              return True
+
+          def freeze_role(role_name):
+              try:
+                  iam.update_assume_role_policy(
+                      RoleName=role_name,
+                      PolicyDocument=json.dumps({
+                          "Version": "2012-10-17",
+                          "Statement": []
+                      })
+                  )
+                  return True
+              except Exception as e:
+                  print(f"[!] Failed to update role trust policy: {e}")
+                  return False
+      Environment:
+        Variables:
+          QUARANTINE_SG_ID: !Ref IsolationSecurityGroup
+          S3_BUCKET: !Ref IncidentLogBucketName
+
+  ### 5. EventBridge Rule ###
+  GuardDutyEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: GuardDutyCryptominerDetectionRule
+      EventPattern:
+        source:
+          - aws.guardduty
+        detail-type:
+          - GuardDuty Finding
+        detail:
+          type:
+            - prefix: CryptoCurrency:EC2/BitcoinTool
+      Targets:
+        - Id: LambdaTarget
+          Arn: !GetAtt CryptominerResponderFunction.Arn
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CryptominerResponderFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt GuardDutyEventRule.Arn
+
+Outputs:
+  LambdaFunctionArn:
+    Description: ARN of the deployed Cryptominer Responder Lambda
+    Value: !GetAtt CryptominerResponderFunction.Arn
+  IsolationSecurityGroupId:
+    Description: ID of the created isolation security group
+    Value: !Ref IsolationSecurityGroup
+  IncidentLogBucketName:
+    Description: Name of the S3 bucket used for storing incident logs
+    Value: !Ref IncidentLogBucket
