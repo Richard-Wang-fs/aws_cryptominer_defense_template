@@ -4,6 +4,14 @@ This project implements an automated response system to defend against cryptocur
 
 ---
 
+## ⚠️ Disclaimer
+
+This project was developed solely for educational purposes as part of a university assignment on cloud security. It is not intended for use in production environments. While the code demonstrates realistic AWS configurations and automated defense logic, it may lack critical safeguards, auditing controls, and reliability guarantees required in real-world deployments.
+
+Use at your own risk.
+
+---
+
 ## 🔧 What It Does
 
 Once deployed, the system performs the following actions automatically upon receiving a GuardDuty finding:
@@ -86,11 +94,6 @@ incidents/i-0a1b2c3d4e5f6g7h-1713590835.json
   }
 }
 ```
-
-This report can be used for:
-- **Forensic auditing**
-- **Compliance**
-- **Automated analytics (e.g. Athena, Glue)**
 
 ---
 
